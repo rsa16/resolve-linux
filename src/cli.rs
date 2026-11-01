@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::catalog::{Catalog, Dependency};
 use crate::detect::{self, Family};
 use crate::exec::Runner;
+use crate::privilege;
 use crate::ui;
 use clap::Parser;
 use nix::unistd::geteuid;
@@ -36,7 +37,7 @@ where
     let dry_run = options.dry_run;
 
     if options.install_deps {
-        return match install_deps_preview(&os_release_path, dry_run) {
+        return match install_deps(&os_release_path, dry_run) {
             Ok(()) => 0,
             Err(message) => {
                 eprintln!("resolve-linux: {message}");
@@ -149,9 +150,8 @@ fn probe_present(runner: &Runner, catalog: &Catalog, dependency: Dependency) -> 
         .is_some_and(|output| catalog.is_present(&output))
 }
 
-/// Print the family's install template for the missing packages. This ticket
-/// never installs anything: only the `--dry-run` preview is available.
-fn install_deps_preview(os_release: &Path, dry_run: bool) -> Result<(), String> {
+/// Install the missing packages for detected family.
+fn install_deps(os_release: &Path, dry_run: bool) -> Result<(), String> {
     let distro = detect::detect(os_release)
         .map_err(|error| format!("cannot read {}: {error}", os_release.display()))?;
     let Some(family) = distro.family else {
@@ -161,12 +161,6 @@ fn install_deps_preview(os_release: &Path, dry_run: bool) -> Result<(), String> 
             distro.manual_dependencies.join(", ")
         ));
     };
-    if !dry_run {
-        return Err(
-            "installing dependencies is not available in this build; re-run with --dry-run to see the command"
-                .to_owned(),
-        );
-    }
 
     let catalog = Catalog::for_family(family);
     let runner = Runner::new(false);
@@ -183,10 +177,21 @@ fn install_deps_preview(os_release: &Path, dry_run: bool) -> Result<(), String> 
         return Ok(());
     }
 
-    Runner::new(true)
-        .run(&catalog.install(&missing))
-        .map_err(|error| format!("cannot print the install command: {error}"))?;
-    Ok(())
+    let command = privilege::escalate(catalog.install(&missing));
+
+    if dry_run {
+        Runner::new(true)
+            .run(&command)
+            .map_err(|error| format!("cannot print the install command: {error}"))?;
+        return Ok(());
+    }
+
+    let status = privilege::run(&command).map_err(|error| error.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("dependency install failed ({status})"))
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -205,7 +210,7 @@ struct Options {
     #[arg(long)]
     dry_run: bool,
 
-    /// Preview the dependency install command; requires --dry-run.
+    /// Install the missing dependencies. Will prompt for sudo.
     #[arg(long, conflicts_with = "report")]
     install_deps: bool,
 

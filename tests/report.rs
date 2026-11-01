@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
@@ -205,6 +205,7 @@ fn run_with_stubs(temp: &TempDir, present: &[&str], args: &[&str]) -> (Output, P
         .args(args)
         .env("PATH", temp.path())
         .env("RESOLVE_LINUX_COMMAND_LOG", &log)
+        .env("RESOLVE_LINUX_SUDO_LOG", temp.path().join("sudo.log"))
         .env("RESOLVE_LINUX_PRESENT", present.join(","))
         .output()
         .expect("run resolve-linux");
@@ -213,6 +214,51 @@ fn run_with_stubs(temp: &TempDir, present: &[&str], args: &[&str]) -> (Output, P
 
 fn command_log(log: &Path) -> String {
     fs::read_to_string(log).unwrap_or_default()
+}
+
+fn write_recording_stub(stub: &Path, log_env: &str, delegate: bool) {
+    let mut body = format!(
+        "#!/bin/sh\n\
+         {{ printf '%s' \"$0\"; for arg in \"$@\"; do printf ' %s' \"$arg\"; done; printf '\\n'; }} >> \"${log_env}\"\n"
+    );
+    if delegate {
+        body.push_str("exec \"$@\"\n");
+    }
+    fs::write(stub, body).expect("write recording stub");
+    fs::set_permissions(stub, fs::Permissions::from_mode(0o755))
+        .expect("make recording stub executable");
+}
+
+fn run_with_pty(args: &[&str], envs: &[(&str, &str)]) -> Output {
+    use std::io::Read;
+
+    let pty = nix::pty::openpty(None, None).expect("open pseudo-terminal");
+    let slave = fs::File::from(pty.slave);
+
+    let mut command = Command::new(BIN);
+    command
+        .args(args)
+        .stdin(Stdio::from(slave.try_clone().expect("clone pty slave")))
+        .stdout(Stdio::from(slave.try_clone().expect("clone pty slave")))
+        .stderr(Stdio::from(slave.try_clone().expect("clone pty slave")));
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+
+    let mut child = command.spawn().expect("spawn resolve-linux on a pty");
+    drop(command);
+    drop(slave);
+
+    let status = child.wait().expect("wait for resolve-linux");
+    let mut output = Vec::new();
+    let mut master = fs::File::from(pty.master);
+    let _ = master.read_to_end(&mut output);
+
+    Output {
+        status,
+        stdout: output,
+        stderr: Vec::new(),
+    }
 }
 
 #[test]
@@ -471,6 +517,7 @@ fn dry_run_install_deps_prints_the_install_template_without_running_it() {
                 _ => "pacman",
             },
         );
+        write_probe_stub(&temp, "sudo");
 
         let (output, log) = run_with_stubs(
             &temp,
@@ -490,9 +537,10 @@ fn dry_run_install_deps_prints_the_install_template_without_running_it() {
             String::from_utf8_lossy(&output.stderr)
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
+        let expected = format!("would run: LC_ALL=C sudo {expected}");
         assert!(
-            stdout.contains(expected),
-            "{fixture_name}: install template missing\nstdout: {stdout}"
+            stdout.lines().any(|line| line.trim() == expected),
+            "{fixture_name}: elevated install argv missing\nstdout: {stdout}"
         );
 
         let recorded = command_log(&log);
@@ -505,15 +553,22 @@ fn dry_run_install_deps_prints_the_install_template_without_running_it() {
             !recorded.contains(mutating),
             "{fixture_name}: --dry-run ran `{mutating}`:\n{recorded}"
         );
+        assert!(
+            !recorded.contains("/sudo "),
+            "{fixture_name}: --dry-run ran sudo:\n{recorded}"
+        );
     }
 }
 
 #[test]
-fn install_deps_without_dry_run_runs_no_package_manager() {
-    let temp = TempDir::new("install-refused");
+fn install_deps_without_a_tty_refuses_before_running_any_install() {
+    let temp = TempDir::new("install-no-tty");
     write_probe_stub(&temp, "rpm");
-    write_probe_stub(&temp, "dnf");
-    let (output, log) = run_with_stubs(
+    write_recording_stub(&temp.path().join("sudo"), "RESOLVE_LINUX_SUDO_LOG", false);
+    write_recording_stub(&temp.path().join("dnf"), "RESOLVE_LINUX_COMMAND_LOG", false);
+    let sudo_log = temp.path().join("sudo.log");
+    let command_log_path = temp.path().join("commands.log");
+    let (output, _) = run_with_stubs(
         &temp,
         &[],
         &[
@@ -524,14 +579,95 @@ fn install_deps_without_dry_run_runs_no_package_manager() {
                 .expect("fixture path is UTF-8"),
         ],
     );
+
+    assert!(!output.status.success(), "a TTY-less install must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        !output.status.success(),
-        "this ticket must not install packages"
+        stderr.contains("sudo -v"),
+        "refusal must instruct the user to prime sudo: {stderr}"
     );
     assert!(
-        !command_log(&log).contains("dnf install"),
-        "package-manager install ran:\n{}",
-        command_log(&log)
+        stderr.contains("dnf install -y"),
+        "refusal must print the exact command for manual use: {stderr}"
+    );
+    assert!(
+        !command_log(&command_log_path).contains("install -y"),
+        "no package-manager install may run without a TTY:\n{}",
+        command_log(&command_log_path)
+    );
+    assert!(
+        !sudo_log.exists(),
+        "sudo was invoked without a terminal: {}",
+        command_log(&sudo_log)
+    );
+}
+
+#[test]
+fn install_deps_on_a_tty_elevates_with_sudo_and_installs_only_missing_packages() {
+    let temp = TempDir::new("install-real");
+    write_probe_stub(&temp, "dpkg-query");
+    write_recording_stub(
+        &temp.path().join("apt-get"),
+        "RESOLVE_LINUX_INSTALL_LOG",
+        false,
+    );
+    write_recording_stub(&temp.path().join("sudo"), "RESOLVE_LINUX_SUDO_LOG", true);
+
+    let command_log_path = temp.path().join("commands.log");
+    let install_log = temp.path().join("install.log");
+    let sudo_log = temp.path().join("sudo.log");
+
+    let output = run_with_pty(
+        &[
+            "--install-deps",
+            "--os-release",
+            fixture("ubuntu-24.04")
+                .to_str()
+                .expect("fixture path is UTF-8"),
+        ],
+        &[
+            ("PATH", temp.path().to_str().expect("temp path is UTF-8")),
+            (
+                "RESOLVE_LINUX_COMMAND_LOG",
+                command_log_path.to_str().expect("temp path is UTF-8"),
+            ),
+            (
+                "RESOLVE_LINUX_INSTALL_LOG",
+                install_log.to_str().expect("temp path is UTF-8"),
+            ),
+            (
+                "RESOLVE_LINUX_SUDO_LOG",
+                sudo_log.to_str().expect("temp path is UTF-8"),
+            ),
+            ("RESOLVE_LINUX_PRESENT", "libglib2.0-0,libcurl4"),
+        ],
+    );
+
+    assert!(
+        output.status.success(),
+        "install failed: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let expected = "apt-get install -y libgl1 libglu1-mesa libcrypt1 ocl-icd-libopencl1 libvulkan1";
+    let recorded = command_log(&sudo_log);
+    assert!(
+        recorded.lines().any(|line| line.ends_with(expected)),
+        "sudo did not receive only the missing packages:\n{recorded}"
+    );
+    assert!(
+        !recorded.contains("libglib2.0-0") && !recorded.contains("libcurl4"),
+        "packages already present were installed again:\n{recorded}"
+    );
+    assert!(
+        command_log(&install_log).contains(expected),
+        "sudo did not start the family package manager:\n{}",
+        command_log(&install_log)
+    );
+    assert!(
+        !command_log(&command_log_path).contains("apt-get install"),
+        "the install ran outside the sudo child:\n{}",
+        command_log(&command_log_path)
     );
 }
 

@@ -1,7 +1,12 @@
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::Duration;
 
+use crate::catalog::Catalog;
 use crate::cli::Report;
+use crate::detect::Family;
+use crate::exec::Runner;
+use crate::privilege;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -9,6 +14,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Padding, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
+
+type Detector = Arc<dyn Fn() -> Result<Report, String> + Send + Sync>;
 
 pub const MIN_COLS: u16 = 80;
 pub const MIN_ROWS: u16 = 24;
@@ -70,7 +77,7 @@ pub fn too_small(cols: u16, rows: u16) -> bool {
 /// Run the terminal UI. Detection is delegated to worker thread.
 pub fn run<F>(detect: F) -> i32
 where
-    F: FnOnce() -> Result<Report, String> + Send + 'static,
+    F: Fn() -> Result<Report, String> + Send + Sync + 'static,
 {
     match too_small_size() {
         Ok(Some((cols, rows))) => {
@@ -86,10 +93,9 @@ where
         }
     }
 
+    let detector: Detector = Arc::new(detect);
     let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = sender.send(detect());
-    });
+    spawn_detection(detector.clone(), sender);
 
     let mut terminal = match ratatui::try_init() {
         Ok(terminal) => terminal,
@@ -99,7 +105,7 @@ where
         }
     };
 
-    let mut app = App::new(receiver);
+    let mut app = App::new(receiver, detector);
     let result = event_loop(&mut terminal, &mut app);
     ratatui::restore();
 
@@ -116,6 +122,12 @@ where
             1
         }
     }
+}
+
+fn spawn_detection(detector: Detector, sender: mpsc::Sender<Result<Report, String>>) {
+    std::thread::spawn(move || {
+        let _ = sender.send(detector());
+    });
 }
 
 fn too_small_size() -> std::io::Result<Option<(u16, u16)>> {
@@ -168,6 +180,11 @@ fn event_loop(
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     app.handle_key(key);
+                    if let Some(action) = app.take_action() {
+                        match action {
+                            Action::InstallDependencies => install_dependencies(terminal, app)?,
+                        }
+                    }
                     dirty = true;
                 }
                 Event::Resize(cols, rows) => {
@@ -181,6 +198,50 @@ fn event_loop(
         }
     }
     Ok(None)
+}
+
+/// Run the elevated install with terminal attached, then restore the
+/// alternate screen and reload the Dependency Set
+fn install_dependencies(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
+    let Some(report) = app.report.as_ref() else {
+        app.log_action("install", "detection has not finished");
+        return Ok(());
+    };
+
+    let Some(family) = Family::from_name(&report.distro.family) else {
+        app.log_action(
+            "install",
+            format!("refused: unsupported distribution `{}`", report.distro.id),
+        );
+        return Ok(());
+    };
+
+    let missing: Vec<String> = report
+        .dependencies
+        .iter()
+        .filter(|dependency| !dependency.present)
+        .map(|dependency| dependency.package.clone())
+        .collect();
+
+    if missing.is_empty() {
+        app.log_action("install", "all dependencies are present");
+        return Ok(());
+    }
+
+    let command = privilege::escalate(Catalog::for_family(family).install(&missing));
+
+    if let Err(error) = privilege::ensure_terminal(&command) {
+        app.log_action("install", error.to_string());
+        return Ok(());
+    }
+
+    app.log_action("install", command.display());
+    ratatui::restore();
+    let status = Runner::new(false).run_interactive(&command);
+    *terminal = ratatui::try_init()?;
+
+    app.record_install_result(&command.display(), status);
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -222,6 +283,11 @@ enum View {
     Screen(Screen),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Action {
+    InstallDependencies,
+}
+
 struct App {
     view: View,
     menu_state: ListState,
@@ -229,13 +295,15 @@ struct App {
     detection_error: Option<String>,
     detection_done: bool,
     receiver: Receiver<Result<Report, String>>,
+    detector: Detector,
+    action: Option<Action>,
     log: Vec<String>,
     log_offset: usize,
     running: bool,
 }
 
 impl App {
-    fn new(receiver: Receiver<Result<Report, String>>) -> Self {
+    fn new(receiver: Receiver<Result<Report, String>>, detector: Detector) -> Self {
         let mut menu_state = ListState::default();
         menu_state.select(Some(0));
         let mut app = Self {
@@ -245,12 +313,63 @@ impl App {
             detection_error: None,
             detection_done: false,
             receiver,
+            detector,
+            action: None,
             log: Vec::new(),
             log_offset: 0,
             running: true,
         };
         app.log_action("status", "detection started");
         app
+    }
+
+    fn take_action(&mut self) -> Option<Action> {
+        self.action.take()
+    }
+
+    fn refresh(&mut self) {
+        let (sender, receiver) = mpsc::channel();
+        self.receiver = receiver;
+        self.report = None;
+        self.detection_done = false;
+        self.detection_error = None;
+        spawn_detection(self.detector.clone(), sender);
+        self.log_action("status", "refreshing");
+    }
+
+    fn record_install_result(
+        &mut self,
+        command: &str,
+        status: std::io::Result<std::process::ExitStatus>,
+    ) {
+        match status {
+            Ok(status) => self.log_command("install", command, status.code()),
+            Err(error) => self.log_action("install", format!("cannot run sudo: {error}")),
+        }
+        self.refresh();
+    }
+
+    fn request_install(&mut self) {
+        let Some(report) = &self.report else {
+            self.log_action("install", "detection has not finished");
+            return;
+        };
+        if !report.distro.supported {
+            self.log_action(
+                "install",
+                format!("refused: unsupported distribution `{}`", report.distro.id),
+            );
+            return;
+        }
+        if report
+            .dependencies
+            .iter()
+            .all(|dependency| dependency.present)
+        {
+            self.log_action("install", "all dependencies are present");
+            return;
+        }
+        self.action = Some(Action::InstallDependencies);
     }
 
     fn poll_detection(&mut self) -> bool {
@@ -315,12 +434,16 @@ impl App {
                 }
                 _ => {}
             },
-            View::Screen(_) => {
-                if key.code == KeyCode::Esc {
+            View::Screen(screen) => match key.code {
+                KeyCode::Esc => {
                     self.view = View::Menu;
                     self.log_action("nav", "main menu");
                 }
-            }
+                KeyCode::Char('i') if screen == Screen::Dependencies => {
+                    self.request_install();
+                }
+                _ => {}
+            },
         }
     }
 
@@ -377,6 +500,9 @@ impl App {
 
         let footer = match self.view {
             View::Menu => "Up/Down select · Enter open · PgUp/PgDn log · q quit",
+            View::Screen(Screen::Dependencies) => {
+                "i install missing · Esc back · PgUp/PgDn log · Ctrl-C quit"
+            }
             View::Screen(_) => "Esc back · PgUp/PgDn log · Ctrl-C quit",
         };
         frame.render_widget(Paragraph::new(footer).style(theme::muted()), chunks[3]);
@@ -555,6 +681,16 @@ impl App {
                 Span::raw(word),
             ]));
         }
+        if report
+            .dependencies
+            .iter()
+            .any(|dependency| !dependency.present)
+        {
+            lines.push(Line::from(""));
+            lines.push(Line::from(
+                "Press i to install the missing packages with sudo.",
+            ));
+        }
         lines
     }
 
@@ -587,6 +723,8 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::style::Color;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
 
     fn report_supported() -> Report {
         Report {
@@ -645,9 +783,17 @@ mod tests {
         }
     }
 
+    fn detector_for(report: Option<Report>) -> Detector {
+        Arc::new(move || {
+            report
+                .clone()
+                .ok_or_else(|| "no detection result configured".to_owned())
+        })
+    }
+
     fn app_with(report: Option<Report>) -> App {
         let (_sender, receiver) = mpsc::channel();
-        let mut app = App::new(receiver);
+        let mut app = App::new(receiver, detector_for(None));
         app.report = report;
         app.detection_done = true;
         app
@@ -765,6 +911,133 @@ mod tests {
     }
 
     #[test]
+    fn the_dependencies_screen_offers_install_only_when_something_is_missing() {
+        let mut app = app_with(Some(report_with_dependencies()));
+        app.view = View::Screen(Screen::Dependencies);
+        let text = render(&mut app, 80, 24);
+        assert!(text.contains("Press i to install"), "{text}");
+
+        app.handle_key(key(KeyCode::Char('i')));
+        assert_eq!(app.take_action(), Some(Action::InstallDependencies));
+
+        let mut app = app_with(Some(report_with_dependencies()));
+        app.view = View::Screen(Screen::Dependencies);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.take_action(),
+            None,
+            "Enter must not start a privileged install"
+        );
+
+        let mut complete = report_with_dependencies();
+        for dependency in &mut complete.dependencies {
+            dependency.present = true;
+        }
+        let mut app = app_with(Some(complete));
+        app.view = View::Screen(Screen::Dependencies);
+        app.handle_key(key(KeyCode::Char('i')));
+        assert_eq!(app.take_action(), None);
+        assert!(
+            app.log
+                .iter()
+                .any(|entry| entry.contains("all dependencies are present")),
+            "{:?}",
+            app.log
+        );
+    }
+
+    #[test]
+    fn unsupported_distributions_never_queue_an_install() {
+        let mut app = app_with(Some(report_unsupported()));
+        app.view = View::Screen(Screen::Dependencies);
+        app.handle_key(key(KeyCode::Char('i')));
+
+        assert_eq!(app.take_action(), None);
+        assert!(
+            app.log
+                .iter()
+                .any(|entry| entry.contains("refused: unsupported")),
+            "{:?}",
+            app.log
+        );
+    }
+
+    #[test]
+    fn a_failed_install_is_logged_and_still_refreshes_the_dependency_set() {
+        let mut app = app_with(None);
+        app.detection_done = true;
+        app.record_install_result(
+            "LC_ALL=C sudo dnf install -y glib2",
+            Ok(ExitStatus::from_raw(1 << 8)),
+        );
+
+        assert!(
+            app.log.iter().any(|entry| entry.contains("exit 1")),
+            "{:?}",
+            app.log
+        );
+        assert!(
+            !app.detection_done,
+            "the table must reload after a failed install"
+        );
+    }
+
+    #[test]
+    fn refresh_reloads_the_report_from_the_detector() {
+        let detector: Detector = Arc::new(|| Ok(report_with_dependencies()));
+        let (_sender, receiver) = mpsc::channel();
+        let mut app = App::new(receiver, detector);
+        app.report = Some(report_supported());
+        app.view = View::Screen(Screen::Dependencies);
+
+        app.refresh();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !app.poll_detection() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "detection did not refresh in time"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let text = render(&mut app, 80, 24);
+        assert!(text.contains("vulkan-loader"), "{text}");
+        assert!(text.contains("✓ present"), "{text}");
+    }
+
+    #[test]
+    fn a_failed_refresh_drops_the_stale_dependency_table() {
+        let detector: Detector = Arc::new(|| Err("probe failed".to_owned()));
+        let (_sender, receiver) = mpsc::channel();
+        let mut app = App::new(receiver, detector);
+        app.report = Some(report_with_dependencies());
+        app.detection_done = true;
+        app.view = View::Screen(Screen::Dependencies);
+
+        app.refresh();
+        assert!(
+            app.report.is_none(),
+            "a refresh must not keep the pre-install table on screen"
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !app.poll_detection() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "detection did not fail in time"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let text = render(&mut app, 80, 24);
+        assert!(text.contains("Detection failed"), "{text}");
+        assert!(
+            !text.contains("vulkan-loader"),
+            "the stale dependency row survived a failed refresh: {text}"
+        );
+    }
+
+    #[test]
     fn status_renders_the_detecting_frame_before_the_worker_finishes() {
         let mut app = app_with(None);
         app.view = View::Screen(Screen::Status);
@@ -775,7 +1048,7 @@ mod tests {
     #[test]
     fn a_late_detection_result_requests_a_repaint_with_the_report() {
         let (sender, receiver) = mpsc::channel();
-        let mut app = App::new(receiver);
+        let mut app = App::new(receiver, detector_for(None));
         app.view = View::Screen(Screen::Status);
 
         let before = render(&mut app, 80, 24);
@@ -794,7 +1067,7 @@ mod tests {
     #[test]
     fn detection_writes_each_probe_to_the_log_pane() {
         let (sender, receiver) = mpsc::channel();
-        let mut app = App::new(receiver);
+        let mut app = App::new(receiver, detector_for(None));
         let mut report = report_supported();
         report.probe_log = vec![ProbeRecord {
             command: "LC_ALL=C rpm -q glib2".to_owned(),
@@ -813,7 +1086,7 @@ mod tests {
     #[test]
     fn a_late_detection_error_requests_a_repaint_with_the_error() {
         let (sender, receiver) = mpsc::channel();
-        let mut app = App::new(receiver);
+        let mut app = App::new(receiver, detector_for(None));
         app.view = View::Screen(Screen::Status);
 
         sender

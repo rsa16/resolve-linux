@@ -28,6 +28,15 @@ impl Family {
             Family::Arch => "pacman",
         }
     }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "debian" => Some(Family::Debian),
+            "fedora" => Some(Family::Fedora),
+            "arch" => Some(Family::Arch),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,6 +167,14 @@ mod tests {
     fn id_wins_over_a_conflicting_id_like() {
         let distro = parse("ID=arch\nID_LIKE=debian\n").expect("valid os-release");
         assert_eq!(distro.family, Some(Family::Arch));
+    }
+
+    #[test]
+    fn family_names_round_trip_through_the_report_field() {
+        for family in [Family::Debian, Family::Fedora, Family::Arch] {
+            assert_eq!(Family::from_name(family.as_str()), Some(family));
+        }
+        assert_eq!(Family::from_name("unsupported"), None);
     }
 
     #[test]

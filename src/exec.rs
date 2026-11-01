@@ -35,6 +35,15 @@ impl CommandSpec {
         self
     }
 
+    /// Run this command through `program`, passing the original program and
+    /// arguments as its argv. Needed for elevation, since `sudo` must be a
+    /// separate process that owns the terminal.
+    pub fn prefixed_with(mut self, program: impl Into<OsString>) -> Self {
+        let original_program = std::mem::replace(&mut self.program, program.into());
+        self.args.insert(0, original_program);
+        self
+    }
+
     pub fn display(&self) -> String {
         let mut parts = Vec::new();
         for (key, value) in &self.env {
@@ -66,15 +75,24 @@ impl Runner {
             return Ok(None);
         }
 
-        let mut command = Command::new(&spec.program);
-        command.args(&spec.args);
-        for (key, value) in &spec.env {
-            command.env(key, value);
-        }
-
-        command.env("LC_ALL", "C");
-        command.output().map(Some)
+        command(spec).output().map(Some)
     }
+
+    /// Run a command with a terminal attached. Required for sudo prompt.
+    pub fn run_interactive(&self, spec: &CommandSpec) -> io::Result<std::process::ExitStatus> {
+        debug_assert!(!self.dry_run, "interactive runs are never a dry run");
+        command(spec).status()
+    }
+}
+
+fn command(spec: &CommandSpec) -> Command {
+    let mut command = Command::new(&spec.program);
+    command.args(&spec.args);
+    for (key, value) in &spec.env {
+        command.env(key, value);
+    }
+    command.env("LC_ALL", "C");
+    command
 }
 
 fn quote(value: &OsStr) -> String {
@@ -185,6 +203,17 @@ mod tests {
             !marker.exists(),
             "shell metacharacters in an argument were interpreted"
         );
+    }
+
+    #[test]
+    fn prefixed_with_moves_the_program_into_the_argument_list() {
+        let spec = CommandSpec::new("apt-get")
+            .arg("install")
+            .arg("-y")
+            .env("EXAMPLE", "1")
+            .prefixed_with("sudo");
+
+        assert_eq!(spec.display(), "EXAMPLE=1 LC_ALL=C sudo apt-get install -y");
     }
 
     #[test]
