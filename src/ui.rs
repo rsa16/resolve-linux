@@ -259,7 +259,11 @@ impl App {
         }
         match self.receiver.try_recv() {
             Ok(Ok(report)) => {
+                let probes = report.probe_log.clone();
                 self.report = Some(report);
+                for probe in probes {
+                    self.log_command("probe", &probe.command, probe.exit_code);
+                }
                 self.detection_done = true;
                 self.log_action("status", "detection complete");
                 true
@@ -341,7 +345,6 @@ impl App {
         self.log_offset = 0;
     }
 
-    #[allow(dead_code)]
     fn log_command(&mut self, action: &str, command: &str, exit_code: Option<i32>) {
         let exit = exit_code
             .map(|code| format!("exit {code}"))
@@ -394,6 +397,7 @@ impl App {
     fn draw_screen(&mut self, frame: &mut Frame, area: Rect, screen: Screen) {
         let lines = match screen {
             Screen::Status => self.status_lines(),
+            Screen::Dependencies => self.dependencies_lines(),
             _ => vec![
                 Line::from("This screen arrives in a later release."),
                 Line::from("Press Esc to return to the menu."),
@@ -405,20 +409,24 @@ impl App {
         frame.render_widget(paragraph, area);
     }
 
+    fn detection_placeholder(&self) -> Vec<Line<'static>> {
+        if let Some(error) = &self.detection_error {
+            return vec![mark_row(
+                "Status",
+                '✗',
+                theme::bad(),
+                format!("Detection failed: {error}"),
+            )];
+        }
+        vec![Line::from(vec![
+            Span::styled("◐ ", theme::accent()),
+            Span::styled("Detecting distribution…", theme::accent()),
+        ])]
+    }
+
     fn status_lines(&self) -> Vec<Line<'static>> {
         let Some(report) = &self.report else {
-            if let Some(error) = &self.detection_error {
-                return vec![mark_row(
-                    "Status",
-                    '✗',
-                    theme::bad(),
-                    format!("Detection failed: {error}"),
-                )];
-            }
-            return vec![Line::from(vec![
-                Span::styled("◐ ", theme::accent()),
-                Span::styled("Detecting distribution…", theme::accent()),
-            ])];
+            return self.detection_placeholder();
         };
 
         let mut lines = Vec::new();
@@ -505,6 +513,51 @@ impl App {
         lines
     }
 
+    fn dependencies_lines(&self) -> Vec<Line<'static>> {
+        let Some(report) = &self.report else {
+            return self.detection_placeholder();
+        };
+
+        if !report.distro.supported {
+            let mut lines = vec![mark_row(
+                "Support",
+                '✗',
+                theme::bad(),
+                "unsupported distribution",
+            )];
+            lines.push(Line::from(""));
+            lines.push(Line::from("Install these packages manually:"));
+            for package in &report.distro.manual_packages {
+                lines.push(Line::from(format!("  • {package}")));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from("No package-manager commands will be run."));
+            return lines;
+        }
+
+        let mut lines = vec![Line::from(vec![
+            Span::styled(
+                format!("{:<14}{:<24}", "Dependency", "Package"),
+                theme::title(),
+            ),
+            Span::styled("Status".to_owned(), theme::title()),
+        ])];
+        for dependency in &report.dependencies {
+            let (mark, style, word) = if dependency.present {
+                ('✓', theme::ok(), "present")
+            } else {
+                ('✗', theme::bad(), "missing")
+            };
+            lines.push(Line::from(vec![
+                Span::raw(format!("{:<14}", dependency.name)),
+                Span::raw(format!("{:<24}", dependency.package)),
+                Span::styled(format!("{mark} "), style),
+                Span::raw(word),
+            ]));
+        }
+        lines
+    }
+
     fn draw_log(&self, frame: &mut Frame, area: Rect) {
         let lines: Vec<Line> = if self.log.is_empty() {
             vec![Line::from("No commands run yet.").style(theme::muted())]
@@ -528,7 +581,9 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{DistroSection, GpuSection, PatchSection, ResolveSection};
+    use crate::cli::{
+        DependencySection, DistroSection, GpuSection, PatchSection, ProbeRecord, ResolveSection,
+    };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::style::Color;
@@ -554,6 +609,25 @@ mod tests {
                 vendors: Vec::new(),
             },
             patch: PatchSection { applicable: false },
+            probe_log: Vec::new(),
+        }
+    }
+
+    fn report_with_dependencies() -> Report {
+        Report {
+            dependencies: vec![
+                DependencySection {
+                    name: "glib".to_owned(),
+                    package: "glib2".to_owned(),
+                    present: true,
+                },
+                DependencySection {
+                    name: "vulkan".to_owned(),
+                    package: "vulkan-loader".to_owned(),
+                    present: false,
+                },
+            ],
+            ..report_supported()
         }
     }
 
@@ -652,6 +726,45 @@ mod tests {
     }
 
     #[test]
+    fn dependencies_screen_shows_one_row_per_dependency_with_symbol_and_word() {
+        let mut app = app_with(Some(report_with_dependencies()));
+        app.view = View::Screen(Screen::Dependencies);
+        let text = render(&mut app, 80, 24);
+
+        assert!(text.contains("Dependency"), "{text}");
+        assert!(text.contains("glib"), "{text}");
+        assert!(text.contains("glib2"), "{text}");
+        assert!(text.contains("✓ present"), "{text}");
+        assert!(text.contains("vulkan"), "{text}");
+        assert!(text.contains("vulkan-loader"), "{text}");
+        assert!(text.contains("✗ missing"), "{text}");
+    }
+
+    #[test]
+    fn dependencies_screen_shows_the_manual_list_for_unsupported_distributions() {
+        let mut app = app_with(Some(report_unsupported()));
+        app.view = View::Screen(Screen::Dependencies);
+        let text = render(&mut app, 80, 24);
+
+        assert!(text.contains("unsupported"), "{text}");
+        assert!(text.contains("Install these packages manually"), "{text}");
+        assert!(text.contains("glib"), "{text}");
+        assert!(text.contains("opencl"), "{text}");
+        assert!(
+            !text.contains("Package"),
+            "unsupported distros must not show a table: {text}"
+        );
+    }
+
+    #[test]
+    fn dependencies_screen_renders_the_detecting_frame() {
+        let mut app = app_with(None);
+        app.view = View::Screen(Screen::Dependencies);
+        let text = render(&mut app, 80, 24);
+        assert!(text.contains("Detecting distribution"), "{text}");
+    }
+
+    #[test]
     fn status_renders_the_detecting_frame_before_the_worker_finishes() {
         let mut app = app_with(None);
         app.view = View::Screen(Screen::Status);
@@ -676,6 +789,25 @@ mod tests {
         let after = render(&mut app, 80, 24);
         assert!(after.contains("Fedora Linux"), "{after}");
         assert!(after.contains("dnf"), "{after}");
+    }
+
+    #[test]
+    fn detection_writes_each_probe_to_the_log_pane() {
+        let (sender, receiver) = mpsc::channel();
+        let mut app = App::new(receiver);
+        let mut report = report_supported();
+        report.probe_log = vec![ProbeRecord {
+            command: "LC_ALL=C rpm -q glib2".to_owned(),
+            exit_code: Some(0),
+        }];
+
+        sender.send(Ok(report)).expect("receiver is alive");
+        assert!(app.poll_detection());
+
+        let text = render(&mut app, 80, 24);
+        assert!(text.contains("[probe]"), "{text}");
+        assert!(text.contains("rpm -q glib2"), "{text}");
+        assert!(text.contains("exit 0"), "{text}");
     }
 
     #[test]

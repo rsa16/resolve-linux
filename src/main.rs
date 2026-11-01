@@ -1,3 +1,4 @@
+mod catalog;
 mod cli;
 mod detect;
 mod exec;

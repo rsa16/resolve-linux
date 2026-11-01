@@ -3,6 +3,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::catalog::Dependency;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Family {
     Debian,
@@ -42,16 +44,6 @@ impl Distro {
     }
 }
 
-const MANUAL_DEPENDENCIES: &[&str] = &[
-    "glib",
-    "libgl",
-    "libglu",
-    "libcurl",
-    "libxcrypt",
-    "opencl",
-    "vulkan",
-];
-
 pub fn default_path() -> PathBuf {
     let etc = PathBuf::from("/etc/os-release");
     if etc.is_file() {
@@ -89,9 +81,9 @@ pub fn parse(contents: &str) -> Result<Distro, String> {
     let manual_dependencies = if family.is_some() {
         Vec::new()
     } else {
-        MANUAL_DEPENDENCIES
+        Dependency::ALL
             .iter()
-            .map(|name| (*name).to_owned())
+            .map(|dependency| dependency.name().to_owned())
             .collect()
     };
 

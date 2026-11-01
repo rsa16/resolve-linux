@@ -45,12 +45,20 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 fn run_report(os_release: &Path) -> Output {
+    let temp = TempDir::new("report-default");
+    for program in ["dpkg-query", "rpm", "pacman"] {
+        write_probe_stub(&temp, program);
+    }
+    let log = temp.path().join("commands.log");
     Command::new(BIN)
         .arg("--report")
         .arg("--os-release")
         .arg(os_release)
         .arg("--resolve-root")
         .arg("/nonexistent/resolve")
+        .env("PATH", temp.path())
+        .env("RESOLVE_LINUX_COMMAND_LOG", &log)
+        .env("RESOLVE_LINUX_PRESENT", "")
         .env("LC_ALL", "C")
         .output()
         .expect("run resolve-linux")
@@ -160,13 +168,236 @@ fn family_and_package_manager_are_detected_per_fixture() {
     }
 }
 
-#[test]
-fn dry_run_executes_no_external_command() {
-    // Report mode has no command to run in the walking skeleton. This guards the
-    // invariant that any command added later must honour --dry-run; the Runner
-    // unit test proves dry-run mode never starts a process.
-    let temp = TempDir::new("stub-path");
+/// A probe stub that records its argv and LC_ALL, reports the packages named
+/// in `RESOLVE_LINUX_PRESENT` as installed, and everything else as missing.
+fn write_probe_stub(temp: &TempDir, program: &str) {
+    let stub = temp.path().join(program);
+    fs::write(
+        &stub,
+        "#!/bin/sh\n\
+         {\n\
+           printf 'command=%s' \"$0\"\n\
+           for arg in \"$@\"; do printf ' %s' \"$arg\"; done\n\
+           printf '\\nLC_ALL=%s\\n' \"$LC_ALL\"\n\
+         } >> \"$RESOLVE_LINUX_COMMAND_LOG\"\n\
+         last=\n\
+         for arg in \"$@\"; do last=$arg; done\n\
+         case \",$RESOLVE_LINUX_PRESENT,\" in\n\
+           *\",$last,\"*) present=1 ;;\n\
+           *) present=0 ;;\n\
+         esac\n\
+         if [ \"$present\" = 1 ]; then\n\
+           case \"$0\" in\n\
+             *dpkg-query) printf 'install ok installed\\n' ;;\n\
+           esac\n\
+           exit 0\n\
+         fi\n\
+         exit 1\n",
+    )
+    .expect("write probe stub");
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755))
+        .expect("make probe stub executable");
+}
+
+fn run_with_stubs(temp: &TempDir, present: &[&str], args: &[&str]) -> (Output, PathBuf) {
     let log = temp.path().join("commands.log");
+    let output = Command::new(BIN)
+        .args(args)
+        .env("PATH", temp.path())
+        .env("RESOLVE_LINUX_COMMAND_LOG", &log)
+        .env("RESOLVE_LINUX_PRESENT", present.join(","))
+        .output()
+        .expect("run resolve-linux");
+    (output, log)
+}
+
+fn command_log(log: &Path) -> String {
+    fs::read_to_string(log).unwrap_or_default()
+}
+
+#[test]
+fn report_probes_every_dependency_per_family() {
+    struct Case {
+        fixture: &'static str,
+        probe: &'static str,
+        expected: &'static [(&'static str, &'static str)],
+        present: &'static [&'static str],
+    }
+
+    let cases = [
+        Case {
+            fixture: "ubuntu-24.04",
+            probe: "dpkg-query",
+            expected: &[
+                ("glib", "libglib2.0-0"),
+                ("libgl", "libgl1"),
+                ("libglu", "libglu1-mesa"),
+                ("libcurl", "libcurl4"),
+                ("libxcrypt", "libcrypt1"),
+                ("opencl", "ocl-icd-libopencl1"),
+                ("vulkan", "libvulkan1"),
+            ],
+            present: &["libglib2.0-0", "libcurl4"],
+        },
+        Case {
+            fixture: "fedora-41",
+            probe: "rpm",
+            expected: &[
+                ("glib", "glib2"),
+                ("libgl", "mesa-libGL"),
+                ("libglu", "mesa-libGLU"),
+                ("libcurl", "libcurl"),
+                ("libxcrypt", "libxcrypt-compat"),
+                ("opencl", "ocl-icd"),
+                ("vulkan", "vulkan-loader"),
+            ],
+            present: &["glib2"],
+        },
+        Case {
+            fixture: "arch",
+            probe: "pacman",
+            expected: &[
+                ("glib", "glib2"),
+                ("libgl", "libglvnd"),
+                ("libglu", "glu"),
+                ("libcurl", "curl"),
+                ("libxcrypt", "libxcrypt-compat"),
+                ("opencl", "ocl-icd"),
+                ("vulkan", "vulkan-icd-loader"),
+            ],
+            present: &["vulkan-icd-loader"],
+        },
+    ];
+
+    for case in cases {
+        let temp = TempDir::new(&format!("probe-{}", case.fixture));
+        write_probe_stub(&temp, case.probe);
+        let (output, log) = run_with_stubs(
+            &temp,
+            case.present,
+            &[
+                "--report",
+                "--os-release",
+                fixture(case.fixture)
+                    .to_str()
+                    .expect("fixture path is UTF-8"),
+                "--resolve-root",
+                "/nonexistent/resolve",
+            ],
+        );
+        let report = json_stdout(&output);
+
+        let entries = report["dependencies"]
+            .as_array()
+            .expect("dependencies is an array");
+        assert_eq!(
+            entries.len(),
+            case.expected.len(),
+            "wrong dependency count for {}: {report}",
+            case.fixture
+        );
+
+        for (logical, package) in case.expected {
+            let entry = entries
+                .iter()
+                .find(|entry| entry["name"] == *logical)
+                .unwrap_or_else(|| panic!("{} is missing from {report}", logical));
+            assert_eq!(entry["package"], *package, "wrong package for {logical}");
+            let present = entry["present"]
+                .as_bool()
+                .unwrap_or_else(|| panic!("{logical} has no boolean present in {report}"));
+            assert_eq!(
+                present,
+                case.present.contains(package),
+                "wrong present state for {logical} on {}",
+                case.fixture
+            );
+        }
+
+        let recorded = command_log(&log);
+        for (_, package) in case.expected {
+            let expected_argv = match case.probe {
+                "dpkg-query" => format!("dpkg-query -W -f=${{Status}} {package}"),
+                "rpm" => format!("rpm -q {package}"),
+                "pacman" => format!("pacman -Q {package}"),
+                other => unreachable!("unexpected probe {other}"),
+            };
+            assert!(
+                recorded.contains(&expected_argv),
+                "missing probe `{expected_argv}` for {}:\n{recorded}",
+                case.fixture
+            );
+        }
+        assert!(
+            recorded
+                .lines()
+                .filter(|line| line.starts_with("LC_ALL="))
+                .all(|line| line == "LC_ALL=C"),
+            "probes must run under LC_ALL=C:\n{recorded}"
+        );
+    }
+}
+
+#[test]
+fn install_deps_on_unsupported_distribution_refuses_and_names_the_id() {
+    let temp = TempDir::new("install-unsupported");
+    let (output, log) = run_with_stubs(
+        &temp,
+        &[],
+        &[
+            "--dry-run",
+            "--install-deps",
+            "--os-release",
+            fixture("opensuse-tumbleweed")
+                .to_str()
+                .expect("fixture path is UTF-8"),
+        ],
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("opensuse-tumbleweed"),
+        "refusal must name the detected ID: {stderr}"
+    );
+    assert!(
+        !log.exists(),
+        "unsupported install-deps ran commands: {}",
+        command_log(&log)
+    );
+}
+
+#[test]
+fn unsupported_distribution_has_no_dependency_entries() {
+    let temp = TempDir::new("unsupported-deps");
+    write_probe_stub(&temp, "rpm");
+    let (output, _) = run_with_stubs(
+        &temp,
+        &[],
+        &[
+            "--report",
+            "--os-release",
+            fixture("opensuse-tumbleweed")
+                .to_str()
+                .expect("fixture path is UTF-8"),
+            "--resolve-root",
+            "/nonexistent/resolve",
+        ],
+    );
+    let report = json_stdout(&output);
+    assert!(
+        report["dependencies"]
+            .as_array()
+            .expect("dependencies is an array")
+            .is_empty(),
+        "an unsupported distro must not claim a Dependency Set: {report}"
+    );
+}
+
+#[test]
+fn dry_run_report_runs_only_read_only_probes() {
+    // Probes are read-only and always run; --dry-run only suppresses commands
+    // that would mutate the machine.
+    let temp = TempDir::new("stub-path");
     for program in [
         "sh",
         "sudo",
@@ -177,33 +408,130 @@ fn dry_run_executes_no_external_command() {
         "rpm",
         "lspci",
     ] {
-        let stub = temp.path().join(program);
-        fs::write(
-            &stub,
-            "#!/bin/sh\nprintf '%s\\n' \"$0 $*\" >> \"$RESOLVE_LINUX_COMMAND_LOG\"\n",
-        )
-        .expect("write stub");
-        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755))
-            .expect("make stub executable");
+        write_probe_stub(&temp, program);
     }
-
-    let output = Command::new(BIN)
-        .arg("--report")
-        .arg("--dry-run")
-        .arg("--os-release")
-        .arg(fixture("fedora-41"))
-        .arg("--resolve-root")
-        .arg("/nonexistent/resolve")
-        .env("PATH", temp.path())
-        .env("RESOLVE_LINUX_COMMAND_LOG", &log)
-        .output()
-        .expect("run resolve-linux");
+    let (output, log) = run_with_stubs(
+        &temp,
+        &["glib2"],
+        &[
+            "--report",
+            "--dry-run",
+            "--os-release",
+            fixture("fedora-41")
+                .to_str()
+                .expect("fixture path is UTF-8"),
+            "--resolve-root",
+            "/nonexistent/resolve",
+        ],
+    );
 
     assert!(output.status.success(), "report should still succeed");
+    let recorded = command_log(&log);
     assert!(
-        !log.exists(),
-        "--dry-run executed commands: {}",
-        fs::read_to_string(&log).unwrap_or_default()
+        recorded.contains("rpm -q glib2"),
+        "probes did not run:\n{recorded}"
+    );
+    for forbidden in ["dnf ", "apt-get ", "sudo ", " -S "] {
+        assert!(
+            !recorded.contains(forbidden),
+            "--dry-run ran a mutating command containing `{forbidden}`:\n{recorded}"
+        );
+    }
+}
+
+#[test]
+fn dry_run_install_deps_prints_the_install_template_without_running_it() {
+    let cases = [
+        (
+            "ubuntu-24.04",
+            "dpkg-query",
+            "apt-get install -y libglib2.0-0 libgl1 libglu1-mesa libcurl4 libcrypt1 ocl-icd-libopencl1 libvulkan1",
+        ),
+        (
+            "fedora-41",
+            "rpm",
+            "dnf install -y glib2 mesa-libGL mesa-libGLU libcurl libxcrypt-compat ocl-icd vulkan-loader",
+        ),
+        (
+            "arch",
+            "pacman",
+            "pacman -S --needed --noconfirm glib2 libglvnd glu curl libxcrypt-compat ocl-icd vulkan-icd-loader",
+        ),
+    ];
+
+    for (fixture_name, probe, expected) in cases {
+        let temp = TempDir::new(&format!("install-{}", fixture_name));
+        write_probe_stub(&temp, probe);
+        // The package manager is a stub too, but it must never run.
+        write_probe_stub(
+            &temp,
+            match probe {
+                "dpkg-query" => "apt-get",
+                "rpm" => "dnf",
+                _ => "pacman",
+            },
+        );
+
+        let (output, log) = run_with_stubs(
+            &temp,
+            &[],
+            &[
+                "--dry-run",
+                "--install-deps",
+                "--os-release",
+                fixture(fixture_name)
+                    .to_str()
+                    .expect("fixture path is UTF-8"),
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "{fixture_name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(expected),
+            "{fixture_name}: install template missing\nstdout: {stdout}"
+        );
+
+        let recorded = command_log(&log);
+        let mutating = match probe {
+            "dpkg-query" => "apt-get install",
+            "rpm" => "dnf install",
+            _ => "pacman -S",
+        };
+        assert!(
+            !recorded.contains(mutating),
+            "{fixture_name}: --dry-run ran `{mutating}`:\n{recorded}"
+        );
+    }
+}
+
+#[test]
+fn install_deps_without_dry_run_runs_no_package_manager() {
+    let temp = TempDir::new("install-refused");
+    write_probe_stub(&temp, "rpm");
+    write_probe_stub(&temp, "dnf");
+    let (output, log) = run_with_stubs(
+        &temp,
+        &[],
+        &[
+            "--install-deps",
+            "--os-release",
+            fixture("fedora-41")
+                .to_str()
+                .expect("fixture path is UTF-8"),
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "this ticket must not install packages"
+    );
+    assert!(
+        !command_log(&log).contains("dnf install"),
+        "package-manager install ran:\n{}",
+        command_log(&log)
     );
 }
 
