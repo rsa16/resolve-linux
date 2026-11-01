@@ -1,8 +1,9 @@
 use std::ffi::OsString;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::detect::{self, Family};
+use crate::ui;
 use clap::Parser;
 use nix::unistd::geteuid;
 use serde::Serialize;
@@ -28,41 +29,20 @@ where
     };
 
     let os_release_path = options.os_release.unwrap_or_else(detect::default_path);
-    let distro = match detect::detect(&os_release_path) {
-        Ok(distro) => distro,
-        Err(error) => {
-            eprintln!(
-                "resolve-linux: cannot read {}: {error}",
-                os_release_path.display()
-            );
-            return 1;
-        }
-    };
-
     let resolve_root = options.resolve_root;
     let _state_dir = options.state_dir;
     let _dry_run = options.dry_run;
 
-    let report = Report {
-        schema_version: 1,
-        distro: DistroSection {
-            id: &distro.id,
-            name: &distro.name,
-            family: distro.family.map(Family::as_str).unwrap_or("unsupported"),
-            supported: distro.supported(),
-            manual_packages: &distro.manual_dependencies,
-        },
-        package_manager: distro.family.map(Family::package_manager),
-        resolve: ResolveSection {
-            installed: resolve_root.is_dir(),
-            version: None,
-            tested: false,
-        },
-        dependencies: Vec::new(),
-        gpu: GpuSection {
-            vendors: Vec::new(),
-        },
-        patch: PatchSection { applicable: false },
+    if !options.report {
+        return ui::run(move || build_report(&os_release_path, &resolve_root));
+    }
+
+    let report = match build_report(&os_release_path, &resolve_root) {
+        Ok(report) => report,
+        Err(message) => {
+            eprintln!("resolve-linux: {message}");
+            return 1;
+        }
     };
 
     let json = match serde_json::to_string(&report) {
@@ -81,6 +61,38 @@ where
     0
 }
 
+fn build_report(os_release: &Path, resolve_root: &Path) -> Result<Report, String> {
+    let distro = detect::detect(os_release)
+        .map_err(|error| format!("cannot read {}: {error}", os_release.display()))?;
+
+    let family = distro.family.map(Family::as_str).unwrap_or("unsupported");
+    let supported = distro.supported();
+
+    Ok(Report {
+        schema_version: 1,
+        distro: DistroSection {
+            id: distro.id,
+            name: distro.name,
+            family: family.to_owned(),
+            supported,
+            manual_packages: distro.manual_dependencies,
+        },
+        package_manager: distro
+            .family
+            .map(|family| family.package_manager().to_owned()),
+        resolve: ResolveSection {
+            installed: resolve_root.is_dir(),
+            version: None,
+            tested: false,
+        },
+        dependencies: Vec::new(),
+        gpu: GpuSection {
+            vendors: Vec::new(),
+        },
+        patch: PatchSection { applicable: false },
+    })
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "resolve-linux",
@@ -88,9 +100,9 @@ where
     about = "Helper to install DaVinci Resolve and Resolve Studio on Linux"
 )]
 struct Options {
-    /// Output a JSON report of system info.
-    #[arg(long = "report", required = true)]
-    _report: bool,
+    /// Output a JSON report of system info instead of starting the terminal UI.
+    #[arg(long = "report")]
+    report: bool,
 
     /// Show commands that would be executed without actually running them.
     #[arg(long)]
@@ -124,12 +136,14 @@ mod tests {
         assert!(options.os_release.is_none());
         assert!(options.state_dir.is_none());
         assert!(!options.dry_run);
+        assert!(options.report);
     }
 
     #[test]
-    fn report_is_required() {
-        assert!(parse(&[]).is_err());
-        assert!(parse(&["--dry-run"]).is_err());
+    fn no_arguments_are_accepted_so_the_tui_can_start() {
+        let options = parse(&[]).expect("no arguments opens the terminal UI");
+        assert!(!options.report);
+        assert!(!parse(&["--dry-run"]).expect("valid arguments").report);
     }
 
     #[test]
@@ -149,6 +163,7 @@ mod tests {
         assert_eq!(options.resolve_root, PathBuf::from("/tmp/resolve"));
         assert_eq!(options.state_dir, Some(PathBuf::from("/tmp/state")));
         assert!(options.dry_run);
+        assert!(options.report);
     }
 
     #[test]
@@ -158,39 +173,39 @@ mod tests {
     }
 }
 
-#[derive(Serialize)]
-struct Report<'a> {
-    schema_version: u32,
-    distro: DistroSection<'a>,
-    package_manager: Option<&'static str>,
-    resolve: ResolveSection,
-    dependencies: Vec<serde_json::Value>,
-    gpu: GpuSection,
-    patch: PatchSection,
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct Report {
+    pub(crate) schema_version: u32,
+    pub(crate) distro: DistroSection,
+    pub(crate) package_manager: Option<String>,
+    pub(crate) resolve: ResolveSection,
+    pub(crate) dependencies: Vec<serde_json::Value>,
+    pub(crate) gpu: GpuSection,
+    pub(crate) patch: PatchSection,
 }
 
-#[derive(Serialize)]
-struct DistroSection<'a> {
-    id: &'a str,
-    name: &'a str,
-    family: &'static str,
-    supported: bool,
-    manual_packages: &'a [String],
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct DistroSection {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) family: String,
+    pub(crate) supported: bool,
+    pub(crate) manual_packages: Vec<String>,
 }
 
-#[derive(Serialize)]
-struct ResolveSection {
-    installed: bool,
-    version: Option<String>,
-    tested: bool,
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ResolveSection {
+    pub(crate) installed: bool,
+    pub(crate) version: Option<String>,
+    pub(crate) tested: bool,
 }
 
-#[derive(Serialize)]
-struct GpuSection {
-    vendors: Vec<String>,
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct GpuSection {
+    pub(crate) vendors: Vec<String>,
 }
 
-#[derive(Serialize)]
-struct PatchSection {
-    applicable: bool,
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PatchSection {
+    pub(crate) applicable: bool,
 }
