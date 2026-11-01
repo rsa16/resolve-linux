@@ -1,0 +1,9 @@
+NAME="Nobara Linux"
+VERSION="41"
+ID=nobara
+ID_LIKE="fedora"
+VERSION_ID=41
+PRETTY_NAME="Nobara Linux 41"
+ANSI_COLOR="0;38;2;80;160;200"
+HOME_URL="https://nobaraproject.org/"
+BUG_REPORT_URL="https://github.com/Nobara-Project/nobara-project/issues"

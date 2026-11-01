@@ -1,0 +1,8 @@
+NAME="Fedora Linux"
+VERSION="41 (KDE Plasma)"
+ID=fedora
+VERSION_ID=41
+PRETTY_NAME="Fedora Linux 41 (KDE Plasma)"
+ANSI_COLOR="0;38;2;60;110;180"
+HOME_URL="https://fedoraproject.org/"
+BUG_REPORT_URL="https://bugzilla.redhat.com/"
