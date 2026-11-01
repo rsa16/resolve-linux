@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR -- '*.rs')
+
+if [ -n "$staged" ]; then
+    echo "pre-commit: rustfmt --check on staged Rust files"
+    rustfmt --edition 2024 --check $staged
+fi
+
+echo "pre-commit: cargo clippy --all-targets -D warnings"
+cargo clippy --all-targets -- -D warnings

@@ -1,8 +1,8 @@
 [package]
 name = "resolve-linux"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.85"
+edition = "2024"
+rust-version = "1.99.1"
 description = "DaVinci Resolve Install Helper"
 license = "GPL-3.0-or-later"
 

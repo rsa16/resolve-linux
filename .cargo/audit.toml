@@ -1,0 +1,9 @@
+# cargo-audit configuration
+[advisories]
+ignore = [
+    # No ignored advisories. Exceptions belong here as:
+    # "RUSTSEC-0000-0000" = "owner: @name, reason: <why risk is acceptable>, review: YYYY-MM-DD",
+]
+
+[yanked]
+enabled = true
